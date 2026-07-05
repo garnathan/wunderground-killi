@@ -1,9 +1,9 @@
-# garden-weather
+# wunderground-killi
 
 Live readings from a **SensorPush HTP.xw** environmental sensor in the garden,
 published every 5 minutes by a Raspberry Pi (`home-pi`) over Bluetooth LE.
 
-- **Live trend chart:** https://garnathan.github.io/garden-weather/
+- **Live trend chart:** https://garnathan.github.io/wunderground-killi/
 - **Latest reading (JSON):** [`latest.json`](latest.json) — consumed by the Android home-screen widget
 - **Rolling ~7-day window:** [`data/recent.json`](data/recent.json) — drives the chart
 - **Full archive:** `data/YYYY-MM.csv` — every reading, one row each (open in Excel/pandas)
