@@ -123,11 +123,18 @@ function prevMonthStr(mstr){
 function monthCandidates(){
   const out = [];
   const now = new Date();
-  const end = new Date(now.getFullYear(), now.getMonth()+1, 1); // first of NEXT month (current+1)
-  let d = new Date(FIRST_YEAR, FIRST_MONTH-1, 1);
+  const y = now.getFullYear(), mi = now.getMonth();
+  // Enumerate FIRST_MONTH..current month. Only in the LAST 2 days of the month do we
+  // also probe the NEXT month, to catch a collector (whose +0100 clock can be up to
+  // ~14h ahead of a viewer west of it) that has already rolled over. Outside that
+  // window the +1 probe is a guaranteed 404, so we skip it and keep the console clean.
+  const daysInMonth = new Date(y, mi + 1, 0).getDate();
+  const nearRollover = now.getDate() >= daysInMonth - 1;
+  const end = new Date(y, mi + (nearRollover ? 1 : 0), 1); // first of current (or next, near rollover)
+  let d = new Date(FIRST_YEAR, FIRST_MONTH - 1, 1);
   while (d <= end){
     out.push(ym(d));
-    d = new Date(d.getFullYear(), d.getMonth()+1, 1);
+    d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
   }
   return out;
 }
