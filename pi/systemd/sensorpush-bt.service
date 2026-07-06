@@ -1,0 +1,33 @@
+[Unit]
+Description=SensorPush: bring up the Bluetooth controller and wait until ready
+Documentation=file:/home/pi/sensorpush/wunderground-killi/pi/OPERATIONS.md
+# The onboard Pi BT is a UART controller attached by hciuart.service -- which
+# bluetooth.service does NOT pull in -- so order after BOTH (and dbus, for
+# bluetoothctl). Without hciuart, hci0 may not be enumerated when this unit runs.
+After=hciuart.service bluetooth.service dbus.service
+Wants=hciuart.service bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=90
+SyslogIdentifier=sensorpush-bt
+# The pre-wait steps are BEST-EFFORT (leading '-'): at cold boot the controller
+# may not be enumerated yet, so a "No default controller available" exit 1 here
+# must NOT fail the unit and skip the bounded wait-ready loop below (which is the
+# exact code written to tolerate "adapter not ready yet").
+ExecStart=-/usr/sbin/rfkill unblock bluetooth
+ExecStart=-/usr/bin/bluetoothctl power on
+# Bounded wait-ready loop. Retries unblock + power-on every iteration until the
+# controller reports up. Prefer the default controller (bluetoothctl show) so a
+# USB dongle enumerating as hci1 is still handled; fall back to hci0 as a probe.
+ExecStart=/bin/sh -c 'for i in $(seq 1 30); do \
+    rfkill unblock bluetooth 2>/dev/null; \
+    bluetoothctl power on >/dev/null 2>&1; \
+    bluetoothctl show 2>/dev/null | grep -q "Powered: yes" && exit 0; \
+    hciconfig hci0 2>/dev/null | grep -q "UP RUNNING" && exit 0; \
+    sleep 2; \
+  done; echo "bt-not-ready after 60s" >&2; exit 1'
+
+[Install]
+WantedBy=multi-user.target

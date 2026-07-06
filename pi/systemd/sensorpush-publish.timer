@@ -1,0 +1,18 @@
+[Unit]
+Description=SensorPush: publish cadence (fast post-boot fire + 5-min steady state)
+Documentation=file:/home/pi/sensorpush/wunderground-killi/pi/OPERATIONS.md
+
+[Timer]
+# OnBootSec is on CLOCK_MONOTONIC -- the only trustworthy first-fire on an
+# RTC-less Pi (Persistent/OnCalendar are wall-clock based and unreliable pre-NTP).
+OnBootSec=90s
+# 5-minute steady-state cadence, snapped to the boundary (not coalesced late).
+OnCalendar=*:0/5
+AccuracySec=1s
+# Catch a genuinely-missed calendar run once the clock is good (single catch-up,
+# not a stampede). NOT relied upon for the first post-boot fire.
+Persistent=true
+Unit=sensorpush-publish.service
+
+[Install]
+WantedBy=timers.target

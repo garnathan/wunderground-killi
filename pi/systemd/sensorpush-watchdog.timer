@@ -1,0 +1,13 @@
+[Unit]
+Description=SensorPush: watchdog cadence
+Documentation=file:/home/pi/sensorpush/wunderground-killi/pi/OPERATIONS.md
+
+[Timer]
+# Start checking a few minutes after boot; then every 10 minutes.
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=sensorpush-watchdog.service
+
+[Install]
+WantedBy=timers.target

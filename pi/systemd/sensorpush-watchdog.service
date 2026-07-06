@@ -1,0 +1,18 @@
+[Unit]
+Description=SensorPush: watchdog -- heartbeat freshness + BT health, self-heal
+Documentation=file:/home/pi/sensorpush/wunderground-killi/pi/OPERATIONS.md
+After=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/pi/sensorpush
+EnvironmentFile=/home/pi/sensorpush/.env
+ExecStart=/home/pi/sensorpush/venv/bin/python /home/pi/sensorpush/publish.py --watchdog
+# Sized to comfortably exceed the worst-case wedge-heal path (adapter-down bring-up
+# + bluetoothd restart + a stale-heartbeat corrective restart, each bounded by the
+# _sh subprocess timeouts summing to ~4-5 min in the pathological slow-D-Bus case)
+# so systemd never SIGKILLs the watchdog partway through a recovery.
+TimeoutStartSec=300
+SyslogIdentifier=sensorpush-watchdog

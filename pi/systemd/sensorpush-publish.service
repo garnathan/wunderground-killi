@@ -1,0 +1,32 @@
+[Unit]
+Description=SensorPush: read BLE sensor, upload to Weather Underground, commit to GitHub
+Documentation=file:/home/pi/sensorpush/wunderground-killi/pi/OPERATIONS.md
+# Ordering only -- every dependency is SOFT (Wants=, never Requires=), so a down
+# WiFi or a wedged adapter DEGRADES but never FAILS the unit; the in-code clock
+# guard + BLE-reset layer handle the degraded case and the timer retries.
+After=network-online.target time-sync.target bluetooth.target sensorpush-bt.service
+Wants=network-online.target time-sync.target sensorpush-bt.service
+# Never latch into "start request repeated too quickly (refused)".
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/pi/sensorpush
+EnvironmentFile=/home/pi/sensorpush/.env
+Environment=GIT_TERMINAL_PROMPT=0
+ExecStart=/home/pi/sensorpush/venv/bin/python /home/pi/sensorpush/publish.py
+# HARD backstop. publish.py enforces its OWN overall wall-clock deadline
+# (MAX_CYCLE_SEC=300s): the BLE phase is capped to 300-100=200s, WU ends by
+# 300-30=270s, and write_files() -- the data-critical step -- runs immediately
+# after WU, i.e. no later than ~270s. git ops are clamped to the remaining
+# budget. So the reading is ALWAYS persisted before this timeout, and the only
+# thing systemd's kill can interrupt is a push (already committed locally, ships
+# next cycle). 360 > 300 + one in-flight git op (<=45s) with margin.
+TimeoutStartSec=360
+TimeoutStopSec=30
+SendSIGKILL=yes
+KillMode=control-group
+SyslogIdentifier=sensorpush-publish
+RemainAfterExit=no
+# No Restart= -- the timer owns re-runs.
