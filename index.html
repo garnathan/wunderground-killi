@@ -40,6 +40,7 @@
   }
   .ranges button:hover{color:var(--ink)}
   .ranges button.active{background:var(--hum); border-color:var(--hum); color:#04122b; font-weight:600}
+  #summary{color:var(--muted); font-size:12px; margin:-4px 0 12px; font-variant-numeric:tabular-nums; min-height:16px}
   .chart-wrap{position:relative; height:min(52vh,420px)}
   #empty{display:none; text-align:center; color:var(--muted); padding:48px 12px}
   footer{color:var(--muted); font-size:12px; text-align:center; margin-top:18px}
@@ -62,10 +63,11 @@
 <div class="card">
   <div class="ranges" id="ranges">
     <button data-h="6">6 h</button>
-    <button data-h="24" class="active">24 h</button>
+    <button data-h="24">24 h</button>
     <button data-h="168">7 d</button>
-    <button data-h="0">All</button>
+    <button data-h="0" class="active">All</button>
   </div>
+  <div id="summary"></div>
   <div class="chart-wrap"><canvas id="chart"></canvas></div>
   <div id="empty">No readings yet — waiting for the first upload from <code>home-pi</code>.</div>
 </div>
@@ -79,10 +81,25 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <script>
+"use strict";
 const C = getComputedStyle(document.documentElement);
 const COL = k => C.getPropertyValue('--'+k).trim();
-let chart, rangeH = 24, all = [];
-const RAW = 'https://raw.githubusercontent.com/garnathan/wunderground-killi/main/'; // site is served from the gh-pages branch; live data lives on main
+
+// Site is served from the gh-pages branch; live data lives on the main branch and
+// is fetched cross-origin from raw.githubusercontent (access-control-allow-origin:*).
+const RAW = 'https://raw.githubusercontent.com/garnathan/wunderground-killi/main/';
+const FIRST_YEAR = 2026, FIRST_MONTH = 7;      // hard floor — no data exists before 2026-07
+const CACHE_PREFIX = 'wxk:';                    // localStorage key for immutable PAST months
+const REFRESH_MS = 180000;                      // auto-refresh cadence (3 min)
+const DECIMATE_SAMPLES = 1500;                  // lttb target sample count
+
+// Numeric columns of the CSV/JSON reading (ts + wu_status are text and handled separately).
+const NUMERIC = ['temperature_c','temperature_f','humidity_pct','pressure_station_mbar',
+                 'pressure_sealevel_mbar','dew_point_c','heat_index_c'];
+
+let chart, rangeH = 0, all = [], loading = false;   // rangeH=0 => "All" is the default on load
+
+/* ------------------------------------------------------------------ helpers */
 
 function fmtAgo(sec){
   const s = Math.max(0, Math.floor(Date.now()/1000 - sec));
@@ -91,81 +108,430 @@ function fmtAgo(sec){
   return Math.round(s/3600)+'h ago';
 }
 
-function paintTiles(d){
-  if(!d || d.temperature_c==null) return;
-  const set=(id,v)=>document.getElementById(id).textContent=v;
-  set('t-temp', d.temperature_c.toFixed(1)+' °C');
-  set('t-tempf', (d.temperature_f!=null? d.temperature_f.toFixed(1)+' °F':''));
-  set('t-hum', d.humidity_pct.toFixed(0)+' %');
-  set('t-dew2', d.dew_point_c!=null? d.dew_point_c.toFixed(1)+' °C':'');
-  set('t-pres', (d.pressure_sealevel_mbar??d.pressure_station_mbar).toFixed(1)+' mb');
-  set('t-presst', d.pressure_station_mbar!=null? d.pressure_station_mbar.toFixed(1)+' mb station':'');
-  set('t-dew', d.dew_point_c!=null? d.dew_point_c.toFixed(1)+' °C':'–');
-  set('t-hi', d.heat_index_c!=null? d.heat_index_c.toFixed(1)+' °C':'');
-  const u = document.getElementById('updated');
-  const epoch = d.epoch ?? (d.ts? Date.parse(d.ts)/1000 : null);
-  if(epoch){ u.textContent='updated '+fmtAgo(epoch); u.classList.toggle('stale', (Date.now()/1000-epoch)>1800); }
+// "YYYY-MM" for a Date, zero-padded.
+function ym(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); }
+function currentMonthStr(){ return ym(new Date()); }
+// "YYYY-MM" one calendar month before the given "YYYY-MM" (rolls the year at Jan).
+function prevMonthStr(mstr){
+  const p = mstr.split('-'), y = +p[0], mo = +p[1];
+  return ym(new Date(y, mo-1-1, 1));   // mo is 1-based; -1 to 0-based, -1 for prev month
 }
 
-function series(rows, key){ return rows.map(r=>({x:(r.epoch??Date.parse(r.ts)/1000)*1000, y:r[key]})); }
+// Enumerate candidate months from the 2026-07 hard floor through the viewer's
+// current month + 1 (lookahead survives month-rollover / a viewer ahead of the
+// collector's timezone). Real calendar stepping so Dec->Jan rolls the year.
+function monthCandidates(){
+  const out = [];
+  const now = new Date();
+  const end = new Date(now.getFullYear(), now.getMonth()+1, 1); // first of NEXT month (current+1)
+  let d = new Date(FIRST_YEAR, FIRST_MONTH-1, 1);
+  while (d <= end){
+    out.push(ym(d));
+    d = new Date(d.getFullYear(), d.getMonth()+1, 1);
+  }
+  return out;
+}
+
+/* --------------------------------------------------------------- CSV parsing */
+
+// Parse a monthly CSV by HEADER NAME (never by fixed position). Tolerates CRLF,
+// blank/trailing lines, truncated tails, duplicate epochs (deduped later), and an
+// embedded comma in the free-text wu_status (the last column). Returns row objects.
+function parseCSV(text){
+  const rows = [];
+  if (!text) return rows;
+  const lines = text.split('\n');
+
+  // Locate the header line (skip any leading blank lines).
+  let hi = 0;
+  while (hi < lines.length && lines[hi].replace(/\r$/,'').trim() === '') hi++;
+  if (hi >= lines.length) return rows;
+
+  const header = lines[hi].replace(/\r$/,'').split(',').map(s => s.trim());
+  const ncols = header.length;
+  const idx = {};
+  header.forEach((h, i) => { idx[h] = i; });
+  if (idx.epoch === undefined) return rows;   // can't place rows on a time axis without epoch
+
+  for (let li = hi+1; li < lines.length; li++){
+    let line = lines[li];
+    if (line == null) continue;
+    line = line.replace(/\r$/,'');            // strip CR (CRLF endings)
+    if (line.trim() === '') continue;         // skip blank / trailing lines
+
+    let parts = line.split(',');
+    // wu_status is the LAST column and may contain commas in future error strings —
+    // fold any surplus fields back into the final column so numeric indices never shift.
+    if (parts.length > ncols){
+      parts = parts.slice(0, ncols-1).concat(parts.slice(ncols-1).join(','));
+    }
+
+    // epoch is mandatory & numeric; a row without a valid epoch can't be plotted (drop, not zero).
+    const ep = parseFloat(parts[idx.epoch]);
+    if (!Number.isFinite(ep)) continue;
+
+    const row = { epoch: ep, ts: parts[idx.ts] !== undefined ? parts[idx.ts] : null };
+    for (const k of NUMERIC){
+      const v = idx[k] !== undefined ? parseFloat(parts[idx[k]]) : NaN;
+      row[k] = Number.isFinite(v) ? v : null;   // blank/NaN -> null so spanGaps bridges it
+    }
+    row.wu_status = (idx.wu_status !== undefined && parts[idx.wu_status] !== undefined)
+      ? parts[idx.wu_status] : '';
+    rows.push(row);
+  }
+  return rows;
+}
+
+// Merge two row lists, dedup by epoch (incoming wins — fresher on refresh / dup rows),
+// return a NEW array sorted ascending by epoch (required for lttb decimation).
+function mergeRows(existing, incoming){
+  const m = new Map();
+  for (const r of existing) m.set(r.epoch, r);
+  for (const r of incoming) m.set(r.epoch, r);
+  const arr = Array.from(m.values());
+  arr.sort((a, b) => a.epoch - b.epoch);
+  return arr;
+}
+
+/* -------------------------------------------------------- localStorage cache */
+// Cache ONLY provably-immutable past months (see loadArchive: gated on the data,
+// not the viewer clock). Every access is wrapped so a quota / private-mode
+// SecurityError degrades to no-cache instead of breaking the page.
+// We store a COMPACT projection (epoch + the 7 numeric plot columns; the free-text
+// wu_status is dropped — it is never read by the renderer) to cut payload ~2-3x.
+// NOTE: localStorage (~5MB) is still not a years-scale store (~4MB/yr even compact);
+// on quota we evict oldest cached months and, failing that, silently skip caching —
+// the page then just re-fetches those months (parallel + decimated, still smooth).
+// If caching must survive multi-year at scale, IndexedDB is the correct home.
+
+// Project a full row to the compact form we persist (renderer never needs wu_status).
+function compactRow(r){
+  const o = { epoch: r.epoch };
+  for (const k of NUMERIC) o[k] = r[k];
+  return o;
+}
+
+function lsKeys(){
+  const keys = [];
+  try{
+    for (let i = 0; i < localStorage.length; i++){
+      const k = localStorage.key(i);
+      if (k && k.indexOf(CACHE_PREFIX) === 0) keys.push(k);
+    }
+  }catch(e){ /* SecurityError etc. */ }
+  return keys;
+}
+
+function cacheGet(month){
+  try{
+    const raw = localStorage.getItem(CACHE_PREFIX + month);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    // Only trust an entry explicitly stored as a COMPLETE (immutable) month.
+    if (!obj || obj.complete !== true || !Array.isArray(obj.rows)) return null;
+    return obj.rows;
+  }catch(e){ return null; }
+}
+
+function cacheSet(month, rows){
+  const payload = JSON.stringify({ complete: true, month, rows: rows.map(compactRow) });
+  try{ localStorage.setItem(CACHE_PREFIX + month, payload); return; }
+  catch(e){ /* fall through to eviction */ }
+  // Quota exceeded (or similar): evict oldest cached months, retry once each.
+  try{
+    const keys = lsKeys().sort();   // "wxk:YYYY-MM" sorts chronologically
+    for (const k of keys){
+      if (k === CACHE_PREFIX + month) continue;
+      try{ localStorage.removeItem(k); }catch(_){ }
+      try{ localStorage.setItem(CACHE_PREFIX + month, payload); return; }catch(_){ }
+    }
+  }catch(e){ /* give up silently — degrade to no-cache */ }
+}
+
+/* ---------------------------------------------------------------- fetching */
+
+// Fetch one month's CSV. Returns an array of rows, or null on absence/failure so a
+// single 404 (absent month, verified to carry CORS headers) or a genuine network
+// error never rejects the Promise.all batch (each promise also resolves, not throws).
+// `bust` sends cache:'no-store' (bypasses the BROWSER HTTP cache) for growing months.
+// NOTE: the ?t= query param does NOT bust raw.githubusercontent's Fastly edge — that
+// CDN keys on path only, not query, so a growing month can still be served up to its
+// max-age=300 (5 min) stale from the edge. That's acceptable: the sensor cadence is
+// itself ~5 min, so the edge floor never hides more than one reading. We keep ?t=
+// only for the browser layer and any query-sensitive intermediary proxy.
+async function fetchMonth(month, bust){
+  const url = RAW + 'data/' + month + '.csv' + (bust ? ('?t=' + Date.now()) : '');
+  try{
+    const res = await fetch(url, bust ? { cache: 'no-store' } : {});
+    if (!res.ok) return null;               // 404 => absent month, skip silently
+    return parseCSV(await res.text());
+  }catch(e){ return null; }                 // offline/DNS/reset => skip, never reject
+}
+
+// Fetch the freshest single reading. cache:'no-store' bypasses the BROWSER cache;
+// the CDN edge (query-insensitive) may still serve it up to its max-age=300 floor —
+// fine at a ~5-min sensor cadence. The ?t= is only for the browser / proxy layer.
+async function fetchLatest(){
+  try{
+    const res = await fetch(RAW + 'latest.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) return null;
+    const j = await res.json();
+    if (j && typeof j === 'object' && j.temperature_c != null) return j;
+    return null;
+  }catch(e){ return null; }
+}
+
+// Load the ENTIRE monthly-CSV archive in parallel. Sets `all` only when new data
+// arrived — a fully empty / failed pass leaves any previously-rendered data intact.
+//
+// Cache safety (fixes the "viewer TZ ahead of the collector" tail-loss hazard):
+// the file names are stamped by the COLLECTOR's clock (+0100, Killiney), but the
+// viewer's clock can be up to ~14h ahead. So we do NOT trust the viewer clock to
+// decide a month is "done":
+//   * READ/skip-fetch is only allowed for months strictly BEFORE the previous
+//     month of the viewer's current month (`m < prevMonthStr(cm)`) — a ≥1-calendar-
+//     month margin that dwarfs any viewer-vs-collector TZ skew. The current month,
+//     the previous month, and the +1 lookahead are ALWAYS re-fetched fresh.
+//   * WRITE complete:true is gated on the DATA, not any clock: a month is only
+//     cached once the archive itself proves it stopped growing, i.e. the newest
+//     loaded epoch falls in a strictly later month. A transient empty/truncated
+//     200 is never cached (rows.length check), so it can't hide a month forever.
+async function loadArchive(){
+  const months = monthCandidates();
+  const cm = currentMonthStr();
+  const immutableBefore = prevMonthStr(cm);   // conservative read boundary (≥1-month margin)
+
+  const results = await Promise.all(months.map(async m => {
+    if (m < immutableBefore){                 // safely-past month: cache-eligible for READ
+      const cached = cacheGet(m);
+      if (cached) return { month: m, rows: cached, fromCache: true };
+      return { month: m, rows: await fetchMonth(m, false), fromCache: false };
+    }
+    // current / previous / lookahead — still may be growing: always fetch fresh, never cache
+    return { month: m, rows: await fetchMonth(m, true), fromCache: false };
+  }));
+
+  const flat = [];
+  for (const r of results) if (Array.isArray(r.rows)) flat.push(...r.rows);
+  if (!flat.length) return;                   // keep existing `all` (truly-empty -> "no readings yet")
+  all = mergeRows([], flat);                  // dedup (incl. duplicate first row) + sort ascending
+
+  // Persist provably-immutable months: only those whose newest reading predates the
+  // newest month present in the archive (so the collector has demonstrably moved on),
+  // and only when they actually parsed rows (a 200-but-empty stays uncached to retry).
+  const newestMonth = ym(new Date(all[all.length-1].epoch * 1000));
+  for (const r of results){
+    if (r.fromCache || !Array.isArray(r.rows) || !r.rows.length) continue;
+    if (r.month < immutableBefore && r.month < newestMonth) cacheSet(r.month, r.rows);
+  }
+}
+
+/* ------------------------------------------------------------------- render */
+
+const num = (v, d) => (v != null && Number.isFinite(v)) ? v.toFixed(d) : null;
+
+function paintTiles(d){
+  if (!d) return;
+  const set = (id, v) => { document.getElementById(id).textContent = v; };
+  const tc = num(d.temperature_c, 1);
+  if (tc == null) return;                   // nothing usable to show
+
+  set('t-temp', tc + ' °C');
+  set('t-tempf', num(d.temperature_f, 1) != null ? num(d.temperature_f, 1) + ' °F' : '');
+  set('t-hum',  num(d.humidity_pct, 0) != null ? num(d.humidity_pct, 0) + ' %' : '–');
+  set('t-dew2', num(d.dew_point_c, 1) != null ? num(d.dew_point_c, 1) + ' °C' : '');
+  const pres = num(d.pressure_sealevel_mbar, 1) ?? num(d.pressure_station_mbar, 1);
+  set('t-pres', pres != null ? pres + ' mb' : '–');
+  set('t-presst', num(d.pressure_station_mbar, 1) != null ? num(d.pressure_station_mbar, 1) + ' mb station' : '');
+  set('t-dew',  num(d.dew_point_c, 1) != null ? num(d.dew_point_c, 1) + ' °C' : '–');
+  set('t-hi',   num(d.heat_index_c, 1) != null ? num(d.heat_index_c, 1) + ' °C' : '');
+
+  const u = document.getElementById('updated');
+  const epoch = (d.epoch != null && Number.isFinite(d.epoch)) ? d.epoch
+              : (d.ts ? Date.parse(d.ts) / 1000 : null);
+  if (epoch){
+    u.textContent = 'updated ' + fmtAgo(epoch);
+    u.classList.toggle('stale', (Date.now()/1000 - epoch) > 1800);
+  }
+}
+
+// "1,234 readings · 5 Jul – 6 Jul 2026" — computed from the actual first/last
+// epoch of the loaded (deduped) data, not from the enumeration bounds.
+function updateSummary(){
+  const el = document.getElementById('summary');
+  if (!all.length){ el.textContent = ''; return; }
+  const f = new Date(all[0].epoch * 1000);
+  const l = new Date(all[all.length-1].epoch * 1000);
+  const mo = dt => dt.toLocaleString('en-GB', { month: 'short' });
+  const firstStr = f.getDate() + ' ' + mo(f) + (f.getFullYear() !== l.getFullYear() ? ' ' + f.getFullYear() : '');
+  const lastStr  = l.getDate() + ' ' + mo(l) + ' ' + l.getFullYear();
+  const span = firstStr === lastStr ? lastStr : (firstStr + ' – ' + lastStr);
+  el.textContent = all.length.toLocaleString() + ' reading' + (all.length === 1 ? '' : 's') + ' · ' + span;
+}
+
+// Build {x,y} points from the canonical array (required for parsing:false).
+// null y-values are preserved so spanGaps bridges the gap.
+function series(rows, key){ return rows.map(r => ({ x: r.epoch * 1000, y: r[key] })); }
+
+// Largest-Triangle-Three-Buckets downsampling — returns the SELECTED indices into
+// `rows` (ascending), or null when `rows` is already small enough (no thinning).
+//
+// Why we downsample the shared `rows` array ONCE here (using temperature as the
+// ranking signal) instead of Chart.js's per-dataset `decimation` plugin: the plugin
+// runs LTTB independently on each dataset, so with a shared x-axis it keeps DIFFERENT
+// source points per series. Our tooltip is interaction.mode:'index' (all 4 series at
+// one x) — with per-dataset thinning, index i in Temp and index i in Humidity would
+// map to different real timestamps (skew up to a bucket width, ~hours at year-scale),
+// silently showing values from different times under one label. Selecting ONE shared
+// index set keeps every series aligned, so the index tooltip stays time-correct while
+// still rendering ~DECIMATE_SAMPLES points. All data remains loaded; only rendering is
+// thinned. (Range views under the threshold render at full resolution — idxs === null.)
+//
+// null y (sensor-error rows) are NEUTRALISED (area 0, never dominate a bucket and
+// excluded from bucket averages) so transient gaps are not over-represented — unlike
+// the plugin's raw LTTB, where JS coerces a null y to 0 and inflates its triangle.
+function lttbIndices(rows, key, threshold){
+  const n = rows.length;
+  if (threshold >= n || threshold < 3) return null;
+  const yAt = i => { const v = rows[i][key]; return (v != null && Number.isFinite(v)) ? v : null; };
+  const xAt = i => rows[i].epoch * 1000;
+
+  const sampled = [0];                                 // always keep the first point
+  const bucketSize = (n - 2) / (threshold - 2);
+  let a = 0;                                            // index of the previously-selected point
+
+  for (let i = 0; i < threshold - 2; i++){
+    // Average x (and mean of non-null y) of the NEXT bucket, used as the triangle apex.
+    let rangeStart = Math.floor((i + 1) * bucketSize) + 1;
+    let rangeEnd   = Math.floor((i + 2) * bucketSize) + 1;
+    if (rangeEnd > n) rangeEnd = n;
+    let avgX = 0, avgY = 0, cX = 0, cY = 0;
+    for (let j = rangeStart; j < rangeEnd; j++){
+      avgX += xAt(j); cX++;
+      const y = yAt(j); if (y != null){ avgY += y; cY++; }
+    }
+    avgX = cX ? avgX / cX : xAt(Math.min(rangeStart, n - 1));
+    avgY = cY ? avgY / cY : 0;
+
+    // Pick the point in the CURRENT bucket with the largest triangle area.
+    const curStart = Math.floor(i * bucketSize) + 1;
+    const curEnd   = Math.floor((i + 1) * bucketSize) + 1;
+    const ax = xAt(a), ay = yAt(a);
+    let maxArea = -1, maxIdx = Math.min(curStart, n - 1);
+    for (let j = curStart; j < curEnd && j < n; j++){
+      const y = yAt(j);
+      const area = (y != null && ay != null)
+        ? Math.abs((ax - avgX) * (y - ay) - (ax - xAt(j)) * (avgY - ay)) * 0.5
+        : 0;                                           // null candidate: neutral, never dominates
+      if (area > maxArea){ maxArea = area; maxIdx = j; }
+    }
+    sampled.push(maxIdx);
+    a = maxIdx;
+  }
+  sampled.push(n - 1);                                 // always keep the last point
+  return sampled;
+}
 
 function draw(){
-  const cut = rangeH? Date.now()/1000 - rangeH*3600 : 0;
-  const rows = all.filter(r => (r.epoch??Date.parse(r.ts)/1000) >= cut);
-  document.getElementById('empty').style.display = rows.length? 'none':'block';
+  // Range cutoff is anchored to the LATEST data point (not a hard "now"), so a
+  // sensor that's behind never filters everything out. "All" (rangeH=0) => whole history.
+  const refT = all.length ? all[all.length-1].epoch : Date.now()/1000;
+  const cut  = rangeH ? refT - rangeH*3600 : 0;
+  const rows = rangeH ? all.filter(r => r.epoch >= cut) : all;
+
+  document.getElementById('empty').style.display = rows.length ? 'none' : 'block';
+
+  // Downsample the SHARED rows once (see lttbIndices) so all 4 series share identical
+  // timestamps at each index — keeps the index-mode tooltip time-correct at scale.
+  const idxs = lttbIndices(rows, 'temperature_c', DECIMATE_SAMPLES);
+  const plot = idxs ? idxs.map(i => rows[i]) : rows;
+
   const ds = [
-    {label:'Temp °C', key:'temperature_c', color:COL('temp'), axis:'y'},
-    {label:'Dew °C', key:'dew_point_c', color:COL('dew'), axis:'y'},
-    {label:'Humidity %', key:'humidity_pct', color:COL('hum'), axis:'y1'},
-    {label:'Pressure mb', key:'pressure_sealevel_mbar', color:COL('pres'), axis:'y2'},
-  ].map(s=>({
-    label:s.label, data:series(rows,s.key), yAxisID:s.axis,
+    {label:'Temp °C',     key:'temperature_c',         color:COL('temp'), axis:'y'},
+    {label:'Dew °C',      key:'dew_point_c',           color:COL('dew'),  axis:'y'},
+    {label:'Humidity %',  key:'humidity_pct',          color:COL('hum'),  axis:'y1'},
+    {label:'Pressure mb', key:'pressure_sealevel_mbar',color:COL('pres'), axis:'y2'},
+  ].map(s => ({
+    label:s.label, data:series(plot, s.key), yAxisID:s.axis,
     borderColor:s.color, backgroundColor:s.color, tension:.3,
     borderWidth:2, pointRadius:0, pointHoverRadius:4, spanGaps:true,
   }));
-  const axis = (id,pos,show)=>({type:'linear',position:pos,display:show,grid:{color:COL('line'),drawOnChartArea:id==='y'},ticks:{color:COL('muted')}});
+
+  const axis = (id,pos,show) => ({
+    type:'linear', position:pos, display:show,
+    grid:{color:COL('line'), drawOnChartArea:id==='y'}, ticks:{color:COL('muted')}
+  });
+
   const cfg = {
     type:'line',
     data:{datasets:ds},
     options:{
       responsive:true, maintainAspectRatio:false, animation:false,
-      interaction:{mode:'index', intersect:false},
+      parsing:false,                         // {x,y} data; also keeps our shared downsample cheap
+      interaction:{mode:'index', intersect:false},   // safe: all series share one downsampled index set
       scales:{
-        x:{type:'time', time:{tooltipFormat:'PP HH:mm'}, grid:{color:COL('line')}, ticks:{color:COL('muted'), maxRotation:0, autoSkipPadding:24}},
+        x:{type:'time', time:{tooltipFormat:'PP HH:mm'}, grid:{color:COL('line')},
+           ticks:{color:COL('muted'), maxRotation:0, autoSkipPadding:24}},
         y:axis('y','left',true), y1:axis('y1','right',true), y2:axis('y2','right',false),
       },
       plugins:{
+        // Chart.js's per-dataset decimation plugin is deliberately DISABLED: on a
+        // shared x-axis it thins each series independently, which would desync the
+        // index-mode tooltip (values from different times under one label). We do a
+        // single shared LTTB downsample in draw() instead (lttbIndices), which keeps
+        // the ~1500-sample rendering AND cross-series index alignment. All data loaded.
+        decimation:{enabled:false},
         legend:{labels:{color:COL('ink'), usePointStyle:true, boxWidth:8}},
         tooltip:{backgroundColor:COL('panel2'), borderColor:COL('line'), borderWidth:1}
       }
     }
   };
-  if(chart){ chart.data=cfg.data; chart.options=cfg.options; chart.update(); }
+
+  if (chart){ chart.data = cfg.data; chart.options = cfg.options; chart.update(); }
   else chart = new Chart(document.getElementById('chart'), cfg);
 }
 
-async function load(){
-  const bust = '?t='+Date.now();
+/* ------------------------------------------------------------------- flows */
+
+// First paint: load the full archive + freshest reading in parallel, then render
+// the ENTIRE history (default "All"). Tiles prefer latest.json, else the last archive row.
+async function init(){
+  if (loading) return; loading = true;
   try{
-    const [recent, latest] = await Promise.all([
-      fetch(RAW+'data/recent.json'+bust).then(r=>r.ok?r.json():[]).catch(()=>[]),
-      fetch(RAW+'latest.json'+bust).then(r=>r.ok?r.json():null).catch(()=>null),
-    ]);
-    all = Array.isArray(recent)? recent : [];
-    paintTiles(latest && latest.temperature_c!=null ? latest : all[all.length-1]);
+    const [, latest] = await Promise.all([ loadArchive(), fetchLatest() ]);
+    paintTiles(latest || (all.length ? all[all.length-1] : null));
+    updateSummary();
     draw();
   }catch(e){ console.error(e); }
+  finally{ loading = false; }
 }
 
-document.getElementById('ranges').addEventListener('click', e=>{
-  const b = e.target.closest('button'); if(!b) return;
+// 3-min tick: refetch ONLY latest.json + the CURRENT month CSV (recomputed each
+// tick to survive month rollover) with cache:'no-store' (browser layer; the CDN
+// edge may still serve up to its 5-min max-age — fine at a ~5-min cadence). Merge
+// the current month by epoch-dedup. Any failure keeps the already-rendered data.
+async function refresh(){
+  if (loading) return; loading = true;
+  try{
+    const cm = currentMonthStr();
+    const [latest, curRows] = await Promise.all([ fetchLatest(), fetchMonth(cm, true) ]);
+    if (Array.isArray(curRows) && curRows.length) all = mergeRows(all, curRows);
+    paintTiles(latest || (all.length ? all[all.length-1] : null));
+    updateSummary();
+    draw();
+  }catch(e){ console.error(e); }
+  finally{ loading = false; }
+}
+
+document.getElementById('ranges').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
   rangeH = +b.dataset.h;
-  document.querySelectorAll('#ranges button').forEach(x=>x.classList.toggle('active', x===b));
+  document.querySelectorAll('#ranges button').forEach(x => x.classList.toggle('active', x === b));
   draw();
 });
 
-load();
-setInterval(load, 180000); // refresh every 3 min
+init();
+setInterval(refresh, REFRESH_MS);
 </script>
 </body>
 </html>
