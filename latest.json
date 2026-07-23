@@ -1,12 +1,12 @@
 {
-  "ts": "2026-07-23T12:22:21+0100",
-  "temperature_c": 23.13,
-  "temperature_f": 73.63,
-  "humidity_pct": 54.6,
-  "pressure_station_mbar": 1016.85,
-  "pressure_sealevel_mbar": 1022.72,
-  "dew_point_c": 13.5,
-  "heat_index_c": 23.1,
-  "epoch": 1784805741,
-  "wu_status": "success"
+  "ts": "2026-07-23T13:12:39+0100",
+  "temperature_c": 22.25,
+  "temperature_f": 72.05,
+  "humidity_pct": 56.07,
+  "pressure_station_mbar": 1016.79,
+  "pressure_sealevel_mbar": 1022.68,
+  "dew_point_c": 13.1,
+  "heat_index_c": 22.2,
+  "epoch": 1784808759,
+  "wu_status": "error: URLError: <urlopen error [Errno -3] Temporary failure in name resolution>"
 }
