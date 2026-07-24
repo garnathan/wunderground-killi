@@ -1,12 +1,12 @@
 {
-  "ts": "2026-07-24T22:55:34+0100",
-  "temperature_c": 18.36,
-  "temperature_f": 65.05,
-  "humidity_pct": 68.63,
-  "pressure_station_mbar": 1005.33,
-  "pressure_sealevel_mbar": 1011.23,
+  "ts": "2026-07-24T23:00:36+0100",
+  "temperature_c": 18.31,
+  "temperature_f": 64.96,
+  "humidity_pct": 68.82,
+  "pressure_station_mbar": 1005.29,
+  "pressure_sealevel_mbar": 1011.19,
   "dew_point_c": 12.5,
-  "heat_index_c": 18.4,
-  "epoch": 1784930134,
+  "heat_index_c": 18.3,
+  "epoch": 1784930436,
   "wu_status": "success"
 }
