@@ -5309,3 +5309,4 @@ epoch,ts,temperature_c,temperature_f,humidity_pct,pressure_station_mbar,pressure
 1787283620,2026-08-21T04:40:20+0100,9.56,49.21,84.74,1005.38,1011.47,7.1,9.6,success
 1787283920,2026-08-21T04:45:20+0100,9.51,49.12,84.91,1005.29,1011.38,7.1,9.5,error: URLError: <urlopen error [Errno -3] Temporary failure in name resolution>
 1787284234,2026-08-21T04:50:34+0100,9.47,49.05,85.03,1005.47,1011.56,7.1,9.5,error: URLError: <urlopen error [Errno -3] Temporary failure in name resolution>
+1787284521,2026-08-21T04:55:21+0100,9.46,49.03,85.31,1005.52,1011.61,7.1,9.5,success
