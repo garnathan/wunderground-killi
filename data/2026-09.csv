@@ -1,0 +1,2 @@
+epoch,ts,temperature_c,temperature_f,humidity_pct,pressure_station_mbar,pressure_sealevel_mbar,dew_point_c,heat_index_c,wu_status
+1788220825,2026-09-01T01:00:25+0100,13.56,56.41,77.9,1008.34,1014.36,9.8,13.6,success
